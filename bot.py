@@ -1461,7 +1461,7 @@ def maybe_auto_ban(uid: int, reason: str) -> None:
 #  8. BOT INSTANCE  +  KEEP-ALIVE  WEB SERVER
 # ═════════════════════════════════════════════════════════════════
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True, num_threads=8)
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True, num_threads=32)
 
 # ───────────────────────────────────────────────────────────────────
 # UI style wrapper — every outgoing message/caption is rendered as a
@@ -3542,7 +3542,20 @@ def post_announcement(html: str) -> None:
 
 # 14. USER  MANAGEMENT
 
+_LAST_SEEN_TS: Dict[str, float] = {}
+
+
 def get_or_create_user(u: types.User, ref: Optional[int] = None) -> Tuple[Dict[str, Any], bool]:
+    # FAST PATH: existing user + no referral -> never rewrite the whole DB
+    # on every button tap. last_seen is refreshed at most once a minute.
+    if ref is None:
+        _k0 = str(u.id)
+        _ro = db_load_ro()["users"].get(_k0)
+        if _ro is not None:
+            _now = time.time()
+            if _now - _LAST_SEEN_TS.get(_k0, 0.0) < 60.0:
+                return copy.deepcopy(_ro), False
+            _LAST_SEEN_TS[_k0] = _now
     db = db_load()
     key = str(u.id)
     is_new = key not in db["users"]
@@ -3796,6 +3809,15 @@ def loading(call: types.CallbackQuery, label: str = "Loading") -> None:
     if not (call and call.message):
         try:
             bot.answer_callback_query(call.id, text=f"⏳ {label}…")
+        except Exception:
+            pass
+        return
+
+    # Instant toast only (default). The animated bar is still available:
+    # set the "loading_animation" setting to True to re-enable it.
+    if not get_setting("loading_animation", False):
+        try:
+            bot.answer_callback_query(call.id, text=f"↻ {label}…")
         except Exception:
             pass
         return
@@ -5731,7 +5753,7 @@ def render_admin(call: types.CallbackQuery) -> None:
     show_menu(call.message.chat.id, PHOTOS["admin"], cap, admin_kb(), call=call)
 
 
-def render_admin_subroute(call: types.CallbackQuery, data: str) -> None:
+def _legacy_render_admin_subroute(call: types.CallbackQuery, data: str) -> None:
     if data == "adm_stats":
         return render_adm_stats(call)
     if data == "adm_users":
@@ -6765,7 +6787,7 @@ def render_adm_github(call: types.CallbackQuery) -> None:
     show_menu(call.message.chat.id, PHOTOS["github"], cap, github_kb(s), call=call)
 
 
-def render_github_subroute(call: types.CallbackQuery, data: str) -> None:
+def _legacy_render_github_subroute(call: types.CallbackQuery, data: str) -> None:
     if data == "gh_backup_now":
         threading.Thread(target=lambda: _gh_backup_thread(call), daemon=True).start()
         ack(call, "Backup started"); return
@@ -14698,6 +14720,17 @@ def _register_extra_routes(data, call):
     if data == "adm_lang_stats":             render_adm_lang_stats(call); return True
     if data == "adm_sched_history":          render_adm_scheduler_history(call); return True
     if data == "adm_export_menu":            render_adm_export_menu(call); return True
+    if data == "adm_pay_approve_select":     render_adm_pay_select(call, "approve"); return True
+    if data == "adm_pay_reject_select":      render_adm_pay_select(call, "reject"); return True
+    if data == "adm_import_db":
+        if not is_owner(call.from_user.id):
+            ack(call, "Owner only"); return True
+        USER_STATES[call.from_user.id] = {"flow": "await_import_db"}
+        bot.send_message(call.message.chat.id,
+            f"<b>{G['warn']} {sc('Import DB')}</b>\n"
+            f"{sc('Send the exported JSON file now')}. /cancel {sc('to abort')}.",
+            parse_mode="HTML")
+        return True
     return False
 
 
@@ -16791,71 +16824,145 @@ def render_adm_confirm_custom(call: types.CallbackQuery, action: str,
 
 # ─── Payment handlers ─────────────────────────────────────────────────────────
 
+def _finish_msg(call: types.CallbackQuery, text: str, back: str = "adm_payment_requests") -> None:
+    """Replace the admin's decision message with `text` (buttons removed).
+    Works for text AND photo/caption messages; never raises."""
+    try:
+        _cancel_loading(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    kb = types.InlineKeyboardMarkup()
+    kb.add(Btn(f"{G['back']}  Payments", callback_data=back, style="primary"))
+    try:
+        if getattr(call.message, "content_type", "text") == "text":
+            bot.edit_message_text(text, chat_id=call.message.chat.id,
+                                  message_id=call.message.message_id,
+                                  parse_mode="HTML", reply_markup=kb)
+        else:
+            bot.edit_message_caption(text, chat_id=call.message.chat.id,
+                                     message_id=call.message.message_id,
+                                     parse_mode="HTML", reply_markup=kb)
+        return
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
+                                      reply_markup=None)
+    except Exception:
+        pass
+    try:
+        bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+
+def _notify_async(uid: Any, text: str) -> None:
+    def _go() -> None:
+        try:
+            bot.send_message(uid, text, parse_mode="HTML")
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
+
 def action_payment_approve(call: types.CallbackQuery, pid: str) -> None:
     if not admin_only_call(call, "approve_payment"):
         return
-    d = db_load()
-    pay = next((x for x in d["payments"] if x.get("id") == pid), None)
-    if not pay:
-        ack(call, "Not found"); return
-    if pay.get("status") in ("approved", "rejected"):
-        ack(call, f"Already {pay['status']}."); return
-    loading(call, "Approving payment")
-    pay["status"] = "approved"
-    pay["approved_by"] = call.from_user.id
-    pay["approved_at"] = ts_iso()
-    db_save(d)
-    if pay.get("kind") == "wallet_topup":
-        u = d["users"].get(str(pay["uid"]))
-        if u:
-            u["wallet"] = int(u.get("wallet", 0)) + int(pay.get("amount", 0))
-            db_save(d)
+    with _db_lock:                      # RLock: one decision at a time
+        d = db_load()
+        pay = next((x for x in d["payments"] if x.get("id") == pid), None)
+        if not pay:
+            ack(call, "Not found"); return
+        if pay.get("status") in ("approved", "rejected"):
+            ack(call, f"Already {pay['status']}.")
+            _finish_msg(call, f"<b>{G['warn']} {sc('Already')} {sc(pay['status'])} #{esc(pid)}</b>")
+            return
+        pay["status"] = "approved"
+        pay["approved_by"] = call.from_user.id
+        pay["approved_at"] = ts_iso()
+        if pay.get("kind") == "wallet_topup":
+            u = d["users"].get(str(pay.get("uid")))
+            if u is not None:
+                u["wallet"] = int(u.get("wallet", 0)) + int(pay.get("amount", 0) or 0)
+        db_save(d)
+    ack(call, "Approved")
+    # ---- slow stuff happens AFTER the admin already got their answer ----
+    try:
+        if pay.get("kind") == "wallet_topup":
+            _notify_async(pay.get("uid"),
+                f"<b>{G['ok']} {sc('Wallet credited')}</b>\n"
+                f"{bullet('Amount', '₹{}'.format(pay.get('amount', 0)))}")
+        elif pay.get("plan"):
+            grant_plan(pay["uid"], pay["plan"])
+            pname = PLAN_LIMITS.get(pay["plan"], {}).get("name", pay["plan"])
+            _notify_async(pay.get("uid"),
+                f"<b>{G['ok']} {sc('Payment approved')}</b> #{esc(pid)}\n"
+                f"{bullet('Plan', pname)}\n{sc('Your plan is now active')}.")
             try:
-                bot.send_message(pay["uid"],
-                    f"<b>{G['ok']} {sc('Wallet credited')}</b>\n"
-                    f"{bullet('Amount', '₹{}'.format(pay['amount']))}", parse_mode="HTML")
+                post_announcement(
+                    f"<b>{G['spark']} ɴᴇᴡ ᴀᴄᴛɪᴠᴀᴛɪᴏɴ</b>\n"
+                    f"{bullet('Plan', pname)}\n{bullet('User', '@hidden')}")
             except Exception:
                 pass
-    elif pay.get("plan"):
-        grant_plan(pay["uid"], pay["plan"])
-    audit(call.from_user.id, "pay_approve", f"pid={pid}")
-    ack(call, "Approved")
+    except Exception:
+        traceback.print_exc()
     try:
-        bot.edit_message_text(f"<b>{G['ok']} {sc('Approved')} #{pid}</b>",
-                              chat_id=call.message.chat.id,
-                              message_id=call.message.message_id, parse_mode="HTML")
+        audit(call.from_user.id, "pay_approve", f"pid={pid}")
     except Exception:
         pass
+    _finish_msg(call, f"<b>{G['ok']} {sc('Approved')} #{esc(pid)}</b>")
 
 
 def action_payment_reject(call: types.CallbackQuery, pid: str) -> None:
     if not admin_only_call(call, "approve_payment"):
         return
-    d = db_load()
-    pay = next((x for x in d["payments"] if x.get("id") == pid), None)
-    if not pay:
-        ack(call, "Not found"); return
-    if pay.get("status") in ("approved", "rejected"):
-        ack(call, f"Already {pay['status']}."); return
-    loading(call, "Rejecting payment")
-    pay["status"] = "rejected"
-    pay["rejected_by"] = call.from_user.id
-    pay["rejected_at"] = ts_iso()
-    db_save(d)
-    audit(call.from_user.id, "pay_reject", f"pid={pid}")
-    try:
-        bot.send_message(pay["uid"],
-            f"<b>{G['no']} {sc('Payment rejected')}</b> #{pid}\n{sc('Contact')} {SUPPORT_USR}",
-            parse_mode="HTML")
-    except Exception:
-        pass
+    with _db_lock:
+        d = db_load()
+        pay = next((x for x in d["payments"] if x.get("id") == pid), None)
+        if not pay:
+            ack(call, "Not found"); return
+        if pay.get("status") in ("approved", "rejected"):
+            ack(call, f"Already {pay['status']}.")
+            _finish_msg(call, f"<b>{G['warn']} {sc('Already')} {sc(pay['status'])} #{esc(pid)}</b>")
+            return
+        pay["status"] = "rejected"
+        pay["rejected_by"] = call.from_user.id
+        pay["rejected_at"] = ts_iso()
+        db_save(d)
     ack(call, "Rejected")
+    _notify_async(pay.get("uid"),
+        f"<b>{G['no']} {sc('Payment rejected')}</b> #{esc(pid)}\n"
+        f"{sc('Contact')} {SUPPORT_USR}")
     try:
-        bot.edit_message_text(f"<b>{G['no']} {sc('Rejected')} #{pid}</b>",
-                              chat_id=call.message.chat.id,
-                              message_id=call.message.message_id, parse_mode="HTML")
+        audit(call.from_user.id, "pay_reject", f"pid={pid}")
     except Exception:
         pass
+    _finish_msg(call, f"<b>{G['no']} {sc('Rejected')} #{esc(pid)}</b>")
+
+
+def render_adm_pay_select(call: types.CallbackQuery, mode: str = "approve") -> None:
+    """List pending payments, one Approve/Reject button per payment."""
+    d = db_load_ro()
+    pend = [x for x in d.get("payments", []) if x.get("status") == "pending"]
+    pend.sort(key=lambda x: x.get("ts", ""), reverse=True)
+    verb = "Approve" if mode == "approve" else "Reject"
+    cb = "payapprove_" if mode == "approve" else "payreject_"
+    lines = [f"<b>💳 {sc(verb + ' Payment')}</b>", G["div_eq"],
+             bullet("Pending", len(pend)), G["div"]]
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if not pend:
+        lines.append(f"  {sc('No pending payments')}")
+    for x in pend[:15]:
+        who = x.get("plan") or x.get("kind") or "payment"
+        lines.append(f"  💳 <code>{esc(x.get('id'))}</code> · {x.get('uid')} · {esc(who)} · ₹{x.get('amount', 0)}")
+        kb.add(Btn(f"{G['ok'] if mode == 'approve' else G['no']}  {verb} {x.get('id')} (₹{x.get('amount', 0)})",
+                   callback_data=f"{cb}{x.get('id')}",
+                   style="success" if mode == "approve" else "danger"))
+    lines.append(G["div"] + FOOTER)
+    kb.add(Btn(f"{G['back']}  Back", callback_data="adm_payment_requests", style="primary"))
+    show_menu(call.message.chat.id, PHOTOS.get("pay_config", PHOTOS["admin"]),
+              "\n".join(lines), kb, call=call)
 
 
 # ─── Admin subroute dispatcher ────────────────────────────────────────────────
@@ -17226,9 +17333,11 @@ def render_admin_subroute(call: types.CallbackQuery, data: str) -> None:
             if fn: fn(call); return
         ack(call, "?"); return
 
-    # delegate to _register_extra_routes from new file
-    if not _register_extra_routes(data, call):
-        ack(call, "?")
+    # delegate to _register_extra_routes, then to the original (legacy)
+    # dispatcher that owns ~170 admin buttons the rewrite dropped.
+    if _register_extra_routes(data, call):
+        return
+    return _legacy_render_admin_subroute(call, data)
 
 
 def render_github_subroute(call: types.CallbackQuery, data: str) -> None:
@@ -17286,7 +17395,44 @@ def render_github_subroute(call: types.CallbackQuery, data: str) -> None:
             except Exception as e:
                 bot.send_message(uid, f"{G['no']} {esc(e)}", parse_mode="HTML")
         threading.Thread(target=_rg, daemon=True).start(); return
-    ack(call, "?")
+    return _legacy_render_github_subroute(call, data)
+
+
+# ─── Compatibility shims (names referenced by features but never defined) ────
+
+def tail_log(bot_id: str, lines: int = 60) -> str:
+    info = RUNNING.get(bot_id)
+    log = (info or {}).get("log") or []
+    return "\n".join(list(log)[-lines:])
+
+
+def _rl_get(key: str) -> int:
+    defaults = {"msg_per_min": 60, "cb_per_min": 120,
+                "upload_per_hour": 20, "bot_start_per_hour": 30}
+    try:
+        return int(get_setting(f"rl_{key}", defaults.get(key, 60)))
+    except Exception:
+        return defaults.get(key, 60)
+
+
+def _load_settings() -> Dict[str, Any]:
+    return copy.deepcopy(settings_load())
+
+
+def _save_settings(d: Dict[str, Any]) -> None:
+    settings_save(d)
+
+
+def cipher_encrypt(raw: bytes) -> str:
+    return base64.b64encode(raw).decode()
+
+
+def cipher_decrypt(enc: Any) -> bytes:
+    return base64.b64decode(enc)
+
+
+def gh_restore_latest() -> Dict[str, Any]:
+    return gh_restore_now()
 
 
 # ─── Callback de-duplication ──────────────────────────────────────────────────
@@ -17944,12 +18090,16 @@ def _route_callback(call: types.CallbackQuery, data: str) -> None:
         except Exception: pass
         return
     # Admin sub-routes
-    if data.startswith("adm_"):
+    if data.startswith("adm_") or data.startswith("ghbrow_"):
         if not admin_only_call(call, "view_stats"): return
         ack(call); render_admin_subroute(call, data); return
     if data.startswith("gh_"):
         if not admin_only_call(call, "view_stats"): return
         ack(call); render_github_subroute(call, data); return
+    if data == "help_main" or data.startswith("help_"):
+        ack(call)
+        render_help_page(call.message.chat.id, "main" if data == "help_main" else data[5:], call=call)
+        return
     # Misc
     if data == "trial_claim":     ack(call); action_trial_claim(call); return
     if data == "coupon_redeem":   ack(call); start_coupon_flow(call); return
